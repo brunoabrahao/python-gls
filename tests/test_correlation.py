@@ -176,3 +176,63 @@ class TestSpatialCorrelation:
             R = cor.get_correlation_matrix(5)
             eigvals = np.linalg.eigvalsh(R)
             assert np.all(eigvals > -1e-10), f"{CorClass.__name__} not PD"
+
+
+class TestAnalyticInverse:
+    """Verify analytic inverse/logdet match dense computation."""
+
+    @pytest.mark.parametrize("phi", [-0.9, -0.3, 0.0, 0.3, 0.7, 0.95])
+    @pytest.mark.parametrize("m", [2, 3, 5, 10, 50])
+    def test_ar1_inverse_matches_dense(self, phi, m):
+        cor = CorAR1(phi=phi)
+        R = cor.get_correlation_matrix(m)
+        R_inv_dense = np.linalg.solve(R, np.eye(m))
+        R_inv_analytic = cor.get_correlation_matrix_inverse(m)
+        np.testing.assert_allclose(R_inv_analytic, R_inv_dense, atol=1e-10)
+
+    @pytest.mark.parametrize("phi", [-0.9, -0.3, 0.0, 0.3, 0.7, 0.95])
+    @pytest.mark.parametrize("m", [2, 3, 5, 10, 50])
+    def test_ar1_logdet_matches_dense(self, phi, m):
+        cor = CorAR1(phi=phi)
+        R = cor.get_correlation_matrix(m)
+        _, logdet_dense = np.linalg.slogdet(R)
+        logdet_analytic = cor.get_log_determinant(m)
+        np.testing.assert_allclose(logdet_analytic, logdet_dense, atol=1e-10)
+
+    @pytest.mark.parametrize("rho", [-0.3, 0.0, 0.3, 0.6, 0.9])
+    @pytest.mark.parametrize("m", [2, 3, 5, 10, 50])
+    def test_comp_symm_inverse_matches_dense(self, rho, m):
+        # Skip invalid rho for given m (need rho > -1/(m-1))
+        if m > 1 and rho <= -1.0 / (m - 1):
+            pytest.skip(f"rho={rho} not PD for m={m}")
+        cor = CorCompSymm(rho=rho)
+        R = cor.get_correlation_matrix(m)
+        R_inv_dense = np.linalg.solve(R, np.eye(m))
+        R_inv_analytic = cor.get_correlation_matrix_inverse(m)
+        np.testing.assert_allclose(R_inv_analytic, R_inv_dense, atol=1e-10)
+
+    @pytest.mark.parametrize("rho", [-0.3, 0.0, 0.3, 0.6, 0.9])
+    @pytest.mark.parametrize("m", [2, 3, 5, 10, 50])
+    def test_comp_symm_logdet_matches_dense(self, rho, m):
+        if m > 1 and rho <= -1.0 / (m - 1):
+            pytest.skip(f"rho={rho} not PD for m={m}")
+        cor = CorCompSymm(rho=rho)
+        R = cor.get_correlation_matrix(m)
+        _, logdet_dense = np.linalg.slogdet(R)
+        logdet_analytic = cor.get_log_determinant(m)
+        np.testing.assert_allclose(logdet_analytic, logdet_dense, atol=1e-10)
+
+    def test_base_fallback_uses_dense(self):
+        """CorSymm (no overrides) should still work via default base methods."""
+        cor = CorSymm(dim=3)
+        # Initialize with some residuals
+        resids = [np.array([1.0, -0.5, 0.3]), np.array([0.2, 0.8, -0.1])]
+        cor.initialize(resids)
+        R = cor.get_correlation_matrix(3)
+        R_inv = cor.get_correlation_matrix_inverse(3)
+        logdet = cor.get_log_determinant(3)
+        # Verify inverse
+        np.testing.assert_allclose(R @ R_inv, np.eye(3), atol=1e-10)
+        # Verify logdet
+        _, expected_logdet = np.linalg.slogdet(R)
+        np.testing.assert_allclose(logdet, expected_logdet, atol=1e-10)

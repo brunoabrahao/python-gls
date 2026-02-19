@@ -109,6 +109,52 @@ class CorStruct(ABC):
         """
         return uparams.copy()
 
+    def get_correlation_matrix_inverse(self, group_size: int, **kwargs) -> NDArray:
+        """Return the inverse of the correlation matrix for a group.
+
+        Default implementation computes the correlation matrix and solves.
+        Subclasses may override with analytic O(m) or O(m²) forms.
+
+        Parameters
+        ----------
+        group_size : int
+            Number of observations in this group.
+        **kwargs
+            Additional context (e.g., time points, positions).
+
+        Returns
+        -------
+        R_inv : (group_size, group_size) inverse correlation matrix.
+        """
+        R = self.get_correlation_matrix(group_size, **kwargs)
+        return np.linalg.solve(R, np.eye(group_size))
+
+    def get_log_determinant(self, group_size: int, **kwargs) -> float:
+        """Return the log-determinant of the correlation matrix.
+
+        Default implementation computes the correlation matrix and uses slogdet.
+        Subclasses may override with O(1) analytic forms.
+
+        Parameters
+        ----------
+        group_size : int
+            Number of observations in this group.
+        **kwargs
+            Additional context (e.g., time points, positions).
+
+        Returns
+        -------
+        logdet : float, log-determinant of the correlation matrix.
+        """
+        R = self.get_correlation_matrix(group_size, **kwargs)
+        sign, logdet = np.linalg.slogdet(R)
+        if sign <= 0:
+            raise ValueError(
+                f"Correlation matrix has non-positive determinant (sign={sign}). "
+                f"The matrix may not be positive-definite."
+            )
+        return float(logdet)
+
     def initialize(self, residuals_by_group: list[NDArray]) -> None:
         """Initialize parameters from OLS residuals.
 

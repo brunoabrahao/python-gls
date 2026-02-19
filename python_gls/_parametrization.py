@@ -29,22 +29,27 @@ def angles_to_cholesky(angles: NDArray, d: int) -> NDArray:
         Lower-triangular Cholesky factor such that L @ L.T is a
         correlation matrix.
     """
+    cos_a = np.cos(angles)
+    sin_a = np.sin(angles)
     L = np.zeros((d, d))
     idx = 0
     for i in range(d):
-        for j in range(i + 1):
-            if j == 0 and i == 0:
-                L[i, j] = 1.0
-            elif j == 0:
-                L[i, j] = np.cos(angles[idx])
-                idx += 1
-            elif j < i:
-                prod = np.prod([np.sin(angles[idx - k - 1]) for k in range(j)])
-                L[i, j] = prod * np.cos(angles[idx])
-                idx += 1
-            else:  # j == i, last column
-                prod = np.prod([np.sin(angles[idx - k - 1]) for k in range(j)])
-                L[i, j] = prod
+        if i == 0:
+            L[0, 0] = 1.0
+            continue
+        # Row i uses angles[idx : idx + i]
+        row_sin = sin_a[idx : idx + i]
+        row_cos = cos_a[idx : idx + i]
+        # Cumulative sine products: cumprod[k] = prod(sin_a[idx..idx+k])
+        cum_sin = np.cumprod(row_sin)
+        # j == 0: cos(angles[idx])
+        L[i, 0] = row_cos[0]
+        # j == 1..i-1: prod(sin[idx..idx+j-1]) * cos(angles[idx+j])
+        for j in range(1, i):
+            L[i, j] = cum_sin[j - 1] * row_cos[j]
+        # j == i (last): prod(sin[idx..idx+i-1])
+        L[i, i] = cum_sin[i - 1]
+        idx += i
     return L
 
 
@@ -100,16 +105,16 @@ def corr_to_angles(R: NDArray) -> NDArray:
     angles = np.zeros(n_angles)
     idx = 0
     for i in range(1, d):
-        for j in range(i):
-            if j == 0:
-                angles[idx] = np.arccos(np.clip(L[i, 0], -1, 1))
+        # j == 0
+        angles[idx] = np.arccos(np.clip(L[i, 0], -1, 1))
+        # j == 1..i-1: product uses preceding angles in this row
+        for j in range(1, i):
+            prod = np.prod(np.sin(angles[idx : idx + j]))
+            if abs(prod) < 1e-15:
+                angles[idx + j] = np.pi / 2
             else:
-                prod = np.prod([np.sin(angles[idx - k - 1]) for k in range(j)])
-                if abs(prod) < 1e-15:
-                    angles[idx] = np.pi / 2
-                else:
-                    angles[idx] = np.arccos(np.clip(L[i, j] / prod, -1, 1))
-            idx += 1
+                angles[idx + j] = np.arccos(np.clip(L[i, j] / prod, -1, 1))
+        idx += i
     return angles
 
 

@@ -6,6 +6,7 @@ structures, equivalent to R's nlme::gls().
 
 from __future__ import annotations
 
+import os
 import warnings
 
 import numpy as np
@@ -313,6 +314,28 @@ class GLS:
             for i, s in enumerate(group_sizes)
         ]
 
+    def _get_corr_inverses(
+        self, group_sizes: list[int]
+    ) -> list[NDArray]:
+        """Get inverse correlation matrices for each group."""
+        if self.correlation is None:
+            return [np.eye(s) for s in group_sizes]
+        return [
+            self.correlation.get_correlation_matrix_inverse(s, group_id=i)
+            for i, s in enumerate(group_sizes)
+        ]
+
+    def _get_corr_logdets(
+        self, group_sizes: list[int]
+    ) -> list[float]:
+        """Get log-determinants of correlation matrices for each group."""
+        if self.correlation is None:
+            return [0.0 for _ in group_sizes]
+        return [
+            self.correlation.get_log_determinant(s, group_id=i)
+            for i, s in enumerate(group_sizes)
+        ]
+
     def _get_var_weights(
         self, idx_groups: list[NDArray]
     ) -> list[NDArray]:
@@ -329,6 +352,7 @@ class GLS:
         maxiter: int = 200,
         tol: float = 1e-8,
         verbose: bool = False,
+        n_jobs: int = 1,
     ) -> GLSResults:
         """Fit the GLS model.
 
@@ -340,6 +364,13 @@ class GLS:
             Convergence tolerance.
         verbose : bool
             If True, print optimization progress.
+        n_jobs : int
+            Number of threads for parallel computation. Use 1 for sequential
+            (default, zero overhead). Use -1 to use all available CPU cores.
+            Threading helps most with unbalanced panels; balanced panels
+            already use batched NumPy operations. For BLAS-level parallelism,
+            set ``OMP_NUM_THREADS``, ``MKL_NUM_THREADS``, or
+            ``OPENBLAS_NUM_THREADS`` environment variables.
 
         Returns
         -------
@@ -351,6 +382,12 @@ class GLS:
                 "No data provided. Use GLS.from_formula('y ~ x', data=df) "
                 "or pass endog= and exog= to the constructor."
             )
+
+        # Resolve n_jobs
+        if n_jobs == -1:
+            n_jobs = os.cpu_count() or 1
+        elif n_jobs < 1:
+            n_jobs = 1
 
         N = len(self._y)
         k = self._X.shape[1]
@@ -377,11 +414,13 @@ class GLS:
 
         # If no correlation or variance structure, just do OLS/GLS with identity
         if self.correlation is None and self.variance is None:
-            corr_matrices = [np.eye(s) for s in group_sizes]
+            corr_inverses = [np.eye(s) for s in group_sizes]
+            corr_logdets = [0.0 for _ in group_sizes]
             var_weights = [np.ones(s) for s in group_sizes]
 
             beta_hat, cov_beta, sigma2_hat, loglik = compute_gls_estimates(
-                X_groups, y_groups, corr_matrices, var_weights, N, self.method
+                X_groups, y_groups, corr_inverses, corr_logdets,
+                var_weights, N, self.method, n_jobs
             )
 
             return GLSResults(
@@ -439,9 +478,13 @@ class GLS:
         def neg_loglik(theta: NDArray) -> float:
             _unpack_params(theta)
             try:
-                corr_matrices = self._get_corr_matrices(group_sizes)
+                corr_inverses = self._get_corr_inverses(group_sizes)
+                corr_logdets = self._get_corr_logdets(group_sizes)
                 var_weights = self._get_var_weights(idx_groups)
-                ll = loglik_func(X_groups, y_groups, corr_matrices, var_weights, N)
+                ll = loglik_func(
+                    X_groups, y_groups, corr_inverses, corr_logdets,
+                    var_weights, N, n_jobs
+                )
             except (np.linalg.LinAlgError, ValueError, FloatingPointError):
                 return 1e15
             n_eval[0] += 1
@@ -474,11 +517,13 @@ class GLS:
             n_iter = 0
 
         # Step 4: Compute final estimates at converged parameters
-        corr_matrices = self._get_corr_matrices(group_sizes)
+        corr_inverses = self._get_corr_inverses(group_sizes)
+        corr_logdets = self._get_corr_logdets(group_sizes)
         var_weights = self._get_var_weights(idx_groups)
 
         beta_hat, cov_beta, sigma2_hat, loglik = compute_gls_estimates(
-            X_groups, y_groups, corr_matrices, var_weights, N, self.method
+            X_groups, y_groups, corr_inverses, corr_logdets,
+            var_weights, N, self.method, n_jobs
         )
 
         # Collect estimated parameters
