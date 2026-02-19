@@ -178,6 +178,7 @@ result = model.fit(
     maxiter=200,     # max optimization iterations
     tol=1e-8,        # convergence tolerance
     verbose=False,   # print optimization progress
+    n_jobs=1,        # parallel threads (-1 for all cores)
 )
 ```
 
@@ -233,7 +234,13 @@ where:
 
 **Spherical parametrization** for `CorSymm`: The unstructured correlation matrix is parametrized via angles that map to a Cholesky factor, guaranteeing positive-definiteness without constrained optimization. Based on [Pinheiro & Bates (1996)](https://doi.org/10.1007/BF00140873).
 
+**Analytic inverses**: AR(1) and compound symmetry correlation matrices have O(m) analytic inverses and O(1) log-determinants, avoiding dense O(m^3) solves.
+
+**Batched computation**: Balanced panels (equal group sizes) use batched NumPy operations — a single matrix multiply across all groups — instead of per-group loops.
+
 **Block-diagonal inversion**: Omega is inverted per-group (O(n*m^3)) rather than as a full matrix (O(N^3)), where n = number of groups and m = group size.
+
+**Thread-level parallelism**: Pass `n_jobs=-1` to `.fit()` to distribute group-level computations across CPU cores via a thread pool. Useful for large unbalanced panels.
 
 **REML**: Restricted maximum likelihood integrates out the fixed effects from the likelihood, giving unbiased variance estimates. This is the default, matching R's `nlme::gls()`.
 
