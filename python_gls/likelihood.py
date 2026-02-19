@@ -5,46 +5,25 @@ leaving only correlation and variance parameters to be optimized.
 """
 
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from numpy.typing import NDArray
 
 
-def _build_omega_block(
-    corr_matrix: NDArray,
-    var_weights: NDArray,
-    sigma2: float,
-) -> NDArray:
-    """Build covariance block: sigma^2 * A^{1/2} R A^{1/2}.
-
-    Parameters
-    ----------
-    corr_matrix : (m, m) correlation matrix for this group.
-    var_weights : (m,) variance weights for this group (standard deviations).
-    sigma2 : scalar residual variance.
-
-    Returns
-    -------
-    Omega block of shape (m, m).
-    """
-    A_half = np.diag(var_weights)
-    return sigma2 * A_half @ corr_matrix @ A_half
-
-
-def _build_omega_inv_block(
-    corr_matrix: NDArray,
+def _build_omega_inv_from_corr_inv(
+    corr_inv: NDArray,
     var_weights: NDArray,
 ) -> NDArray:
-    """Build Omega^{-1} block (up to 1/sigma^2 scaling).
+    """Build Omega^{-1} block from pre-inverted correlation matrix.
 
-    Returns (1/sigma^2) * A^{-1/2} R^{-1} A^{-1/2}.
-    We drop the sigma^2 factor since it cancels in the profile likelihood.
+    Returns A^{-1/2} R^{-1} A^{-1/2} (sigma^2 factor omitted since it
+    cancels in the profile likelihood).
     """
-    # Guard against zero/near-zero weights
     safe_weights = np.where(np.abs(var_weights) < 1e-15, 1e-15, var_weights)
-    A_inv_half = np.diag(1.0 / safe_weights)
-    R_inv = np.linalg.solve(corr_matrix, np.eye(corr_matrix.shape[0]))
-    return A_inv_half @ R_inv @ A_inv_half
+    inv_w = 1.0 / safe_weights
+    # A_inv_half @ corr_inv @ A_inv_half  =  diag(1/w) @ corr_inv @ diag(1/w)
+    return (inv_w[:, None] * corr_inv) * inv_w[None, :]
 
 
 def _safe_log_weights(var_weights: NDArray) -> float:
@@ -53,12 +32,155 @@ def _safe_log_weights(var_weights: NDArray) -> float:
     return float(np.sum(np.log(safe_weights)))
 
 
+def _accumulate_gls_sums(
+    X_groups: list[NDArray],
+    y_groups: list[NDArray],
+    corr_inverses: list[NDArray],
+    corr_logdets: list[float],
+    var_weights_groups: list[NDArray],
+    n_jobs: int = 1,
+) -> tuple[NDArray, NDArray, float, list[NDArray]]:
+    """Accumulate GLS sufficient statistics across groups.
+
+    Returns
+    -------
+    XtOiX : (k, k) accumulated X'Omega^{-1}X
+    XtOiy : (k,) accumulated X'Omega^{-1}y
+    log_det_omega : float, sum of log|Omega_g| (without sigma^2)
+    omega_inv_list : list of per-group Omega^{-1} blocks (cached for RSS)
+    """
+    G = len(X_groups)
+    k = X_groups[0].shape[1]
+
+    # Check if balanced (all groups same size)
+    sizes = {Xg.shape[0] for Xg in X_groups}
+    balanced = len(sizes) == 1
+
+    if balanced and G > 1:
+        m = X_groups[0].shape[0]
+        # Stack into 3D arrays for batched matmul
+        X_3d = np.stack(X_groups)            # (G, m, k)
+        y_3d = np.stack(y_groups)             # (G, m)
+        Ri_3d = np.stack(corr_inverses)       # (G, m, m)
+        W = np.stack(var_weights_groups)       # (G, m)
+
+        # Build all Omega_inv blocks: diag(1/w) @ R_inv @ diag(1/w)
+        safe_W = np.where(np.abs(W) < 1e-15, 1e-15, W)
+        inv_W = 1.0 / safe_W                  # (G, m)
+        # Omega_inv[g] = inv_W[g,:,None] * Ri_3d[g] * inv_W[g,None,:]
+        OmegaInv_3d = (inv_W[:, :, None] * Ri_3d) * inv_W[:, None, :]  # (G, m, m)
+
+        # X'Omega^{-1}X via batched matmul
+        OiX = np.matmul(OmegaInv_3d, X_3d)   # (G, m, k)
+        XtOiX = np.sum(
+            np.matmul(X_3d.transpose(0, 2, 1), OiX), axis=0
+        )                                      # (k, k)
+
+        # X'Omega^{-1}y via batched matmul
+        Oiy = np.squeeze(
+            np.matmul(OmegaInv_3d, y_3d[:, :, None]), axis=-1
+        )                                      # (G, m)
+        XtOiy = np.sum(
+            np.squeeze(
+                np.matmul(X_3d.transpose(0, 2, 1), Oiy[:, :, None]),
+                axis=-1,
+            ),
+            axis=0,
+        )                                      # (k,)
+
+        # log|Omega| = sum(logdet_R) + 2*sum(log(w))
+        log_det_omega = sum(corr_logdets)
+        for wg in var_weights_groups:
+            log_det_omega += 2 * _safe_log_weights(wg)
+
+        omega_inv_list = [OmegaInv_3d[g] for g in range(G)]
+        return XtOiX, XtOiy, log_det_omega, omega_inv_list
+
+    # Unbalanced or single group: sequential or threaded
+    def _per_group(args):
+        Xg, yg, Ri, logdet_R, wg = args
+        Oi = _build_omega_inv_from_corr_inv(Ri, wg)
+        xtox = Xg.T @ Oi @ Xg
+        xtoy = Xg.T @ Oi @ yg
+        ldo = logdet_R + 2 * _safe_log_weights(wg)
+        return xtox, xtoy, ldo, Oi
+
+    items = list(zip(X_groups, y_groups, corr_inverses, corr_logdets, var_weights_groups))
+
+    if n_jobs > 1 and G > 1:
+        with ThreadPoolExecutor(max_workers=n_jobs) as pool:
+            results = list(pool.map(_per_group, items))
+    else:
+        results = [_per_group(item) for item in items]
+
+    XtOiX = np.zeros((k, k))
+    XtOiy = np.zeros(k)
+    log_det_omega = 0.0
+    omega_inv_list = []
+    for xtox, xtoy, ldo, Oi in results:
+        XtOiX += xtox
+        XtOiy += xtoy
+        log_det_omega += ldo
+        omega_inv_list.append(Oi)
+
+    return XtOiX, XtOiy, log_det_omega, omega_inv_list
+
+
+def _compute_rss(
+    X_groups: list[NDArray],
+    y_groups: list[NDArray],
+    omega_inv_list: list[NDArray],
+    beta_hat: NDArray,
+    n_jobs: int = 1,
+) -> float:
+    """Compute weighted residual sum of squares using cached Omega_inv blocks.
+
+    Returns
+    -------
+    float : sum_g (y_g - X_g beta)' Omega_inv_g (y_g - X_g beta)
+    """
+    G = len(X_groups)
+    sizes = {Xg.shape[0] for Xg in X_groups}
+    balanced = len(sizes) == 1
+
+    if balanced and G > 1:
+        m = X_groups[0].shape[0]
+        X_3d = np.stack(X_groups)                              # (G, m, k)
+        y_3d = np.stack(y_groups)                              # (G, m)
+        OmegaInv_3d = np.stack(omega_inv_list)                 # (G, m, m)
+        resid_3d = y_3d - np.squeeze(
+            np.matmul(X_3d, beta_hat[None, :, None]), axis=-1
+        )                                                       # (G, m)
+        Oi_resid = np.squeeze(
+            np.matmul(OmegaInv_3d, resid_3d[:, :, None]), axis=-1
+        )                                                       # (G, m)
+        return float(np.sum(resid_3d * Oi_resid))
+
+    # Unbalanced or single group
+    def _rss_group(args):
+        Xg, yg, Oi = args
+        resid = yg - Xg @ beta_hat
+        return float(resid @ Oi @ resid)
+
+    items = list(zip(X_groups, y_groups, omega_inv_list))
+
+    if n_jobs > 1 and G > 1:
+        with ThreadPoolExecutor(max_workers=n_jobs) as pool:
+            rss_parts = list(pool.map(_rss_group, items))
+    else:
+        rss_parts = [_rss_group(item) for item in items]
+
+    return sum(rss_parts)
+
+
 def profile_loglik_ml(
     X_groups: list[NDArray],
     y_groups: list[NDArray],
-    corr_matrices: list[NDArray],
+    corr_inverses: list[NDArray],
+    corr_logdets: list[float],
     var_weights_groups: list[NDArray],
     nobs: int,
+    n_jobs: int = 1,
 ) -> float:
     """Profile log-likelihood under ML estimation.
 
@@ -70,53 +192,36 @@ def profile_loglik_ml(
     ----------
     X_groups : list of (m_g, k) design matrices per group.
     y_groups : list of (m_g,) response vectors per group.
-    corr_matrices : list of (m_g, m_g) correlation matrices per group.
+    corr_inverses : list of (m_g, m_g) inverse correlation matrices per group.
+    corr_logdets : list of float, log-determinants of correlation matrices.
     var_weights_groups : list of (m_g,) variance weight vectors per group.
     nobs : int, total number of observations.
+    n_jobs : int, number of threads (1=sequential).
 
     Returns
     -------
     float : profile log-likelihood value.
     """
-    k = X_groups[0].shape[1]
     N = nobs
 
-    # Accumulate X'Omega^{-1}X and X'Omega^{-1}y and log|Omega| across groups
-    XtOiX = np.zeros((k, k))
-    XtOiy = np.zeros(k)
-    log_det_omega = 0.0
+    XtOiX, XtOiy, log_det_omega, omega_inv_list = _accumulate_gls_sums(
+        X_groups, y_groups, corr_inverses, corr_logdets, var_weights_groups, n_jobs
+    )
 
-    for Xg, yg, Rg, wg in zip(X_groups, y_groups, corr_matrices, var_weights_groups):
-        Omega_inv = _build_omega_inv_block(Rg, wg)
-        XtOiX += Xg.T @ Omega_inv @ Xg
-        XtOiy += Xg.T @ Omega_inv @ yg
-
-        # log|Omega_g| = log|R_g| + 2*sum(log(w_g)) (sigma^2 factor added later)
-        sign, logdet_R = np.linalg.slogdet(Rg)
-        if sign <= 0:
-            return -np.inf
-        log_det_omega += logdet_R + 2 * _safe_log_weights(wg)
-
-    # Profile beta: beta_hat = (X'Omega^{-1}X)^{-1} X'Omega^{-1}y
     try:
         beta_hat = np.linalg.solve(XtOiX, XtOiy)
     except np.linalg.LinAlgError:
         return -np.inf
 
-    # Profile sigma^2: sigma^2_hat = (1/N) * sum_g (y_g - X_g beta)' Omega_inv_g (y_g - X_g beta)
-    rss_weighted = 0.0
-    for Xg, yg, Rg, wg in zip(X_groups, y_groups, corr_matrices, var_weights_groups):
-        Omega_inv = _build_omega_inv_block(Rg, wg)
-        resid = yg - Xg @ beta_hat
-        rss_weighted += resid @ Omega_inv @ resid
+    rss_weighted = _compute_rss(
+        X_groups, y_groups, omega_inv_list, beta_hat, n_jobs
+    )
 
     sigma2_hat = rss_weighted / N
 
     if sigma2_hat <= 0:
         return -np.inf
 
-    # Log-likelihood: -N/2 * log(2*pi) - N/2 * log(sigma^2) - 1/2 * log|Omega/sigma^2| - N/2
-    # where log|Omega| = N*log(sigma^2) + log_det_omega (without sigma^2)
     loglik = (
         -0.5 * N * np.log(2 * np.pi)
         - 0.5 * N * np.log(sigma2_hat)
@@ -133,9 +238,11 @@ def profile_loglik_ml(
 def profile_loglik_reml(
     X_groups: list[NDArray],
     y_groups: list[NDArray],
-    corr_matrices: list[NDArray],
+    corr_inverses: list[NDArray],
+    corr_logdets: list[float],
     var_weights_groups: list[NDArray],
     nobs: int,
+    n_jobs: int = 1,
 ) -> float:
     """Profile log-likelihood under REML estimation.
 
@@ -146,9 +253,11 @@ def profile_loglik_reml(
     ----------
     X_groups : list of (m_g, k) design matrices per group.
     y_groups : list of (m_g,) response vectors per group.
-    corr_matrices : list of (m_g, m_g) correlation matrices per group.
+    corr_inverses : list of (m_g, m_g) inverse correlation matrices per group.
+    corr_logdets : list of float, log-determinants of correlation matrices.
     var_weights_groups : list of (m_g,) variance weight vectors per group.
     nobs : int, total number of observations.
+    n_jobs : int, number of threads (1=sequential).
 
     Returns
     -------
@@ -157,31 +266,18 @@ def profile_loglik_reml(
     k = X_groups[0].shape[1]
     N = nobs
 
-    XtOiX = np.zeros((k, k))
-    XtOiy = np.zeros(k)
-    log_det_omega = 0.0
-
-    for Xg, yg, Rg, wg in zip(X_groups, y_groups, corr_matrices, var_weights_groups):
-        Omega_inv = _build_omega_inv_block(Rg, wg)
-        XtOiX += Xg.T @ Omega_inv @ Xg
-        XtOiy += Xg.T @ Omega_inv @ yg
-
-        sign, logdet_R = np.linalg.slogdet(Rg)
-        if sign <= 0:
-            return -np.inf
-        log_det_omega += logdet_R + 2 * _safe_log_weights(wg)
+    XtOiX, XtOiy, log_det_omega, omega_inv_list = _accumulate_gls_sums(
+        X_groups, y_groups, corr_inverses, corr_logdets, var_weights_groups, n_jobs
+    )
 
     try:
         beta_hat = np.linalg.solve(XtOiX, XtOiy)
     except np.linalg.LinAlgError:
         return -np.inf
 
-    # REML uses N-k for sigma^2
-    rss_weighted = 0.0
-    for Xg, yg, Rg, wg in zip(X_groups, y_groups, corr_matrices, var_weights_groups):
-        Omega_inv = _build_omega_inv_block(Rg, wg)
-        resid = yg - Xg @ beta_hat
-        rss_weighted += resid @ Omega_inv @ resid
+    rss_weighted = _compute_rss(
+        X_groups, y_groups, omega_inv_list, beta_hat, n_jobs
+    )
 
     N_reml = N - k
     if N_reml <= 0:
@@ -191,7 +287,6 @@ def profile_loglik_reml(
     if sigma2_hat <= 0:
         return -np.inf
 
-    # REML log-likelihood
     sign_xtox, logdet_xtox = np.linalg.slogdet(XtOiX)
     if sign_xtox <= 0:
         return -np.inf
@@ -213,10 +308,12 @@ def profile_loglik_reml(
 def compute_gls_estimates(
     X_groups: list[NDArray],
     y_groups: list[NDArray],
-    corr_matrices: list[NDArray],
+    corr_inverses: list[NDArray],
+    corr_logdets: list[float],
     var_weights_groups: list[NDArray],
     nobs: int,
     method: str = "REML",
+    n_jobs: int = 1,
 ) -> tuple[NDArray, NDArray, float, float]:
     """Compute GLS beta, covariance, sigma^2, and log-likelihood.
 
@@ -233,17 +330,9 @@ def compute_gls_estimates(
     k = X_groups[0].shape[1]
     N = nobs
 
-    XtOiX = np.zeros((k, k))
-    XtOiy = np.zeros(k)
-    log_det_omega = 0.0
-
-    for Xg, yg, Rg, wg in zip(X_groups, y_groups, corr_matrices, var_weights_groups):
-        Omega_inv = _build_omega_inv_block(Rg, wg)
-        XtOiX += Xg.T @ Omega_inv @ Xg
-        XtOiy += Xg.T @ Omega_inv @ yg
-
-        sign, logdet_R = np.linalg.slogdet(Rg)
-        log_det_omega += logdet_R + 2 * _safe_log_weights(wg)
+    XtOiX, XtOiy, log_det_omega, omega_inv_list = _accumulate_gls_sums(
+        X_groups, y_groups, corr_inverses, corr_logdets, var_weights_groups, n_jobs
+    )
 
     try:
         beta_hat = np.linalg.solve(XtOiX, XtOiy)
@@ -253,11 +342,9 @@ def compute_gls_estimates(
             "in the design matrix or a degenerate correlation structure."
         ) from e
 
-    rss_weighted = 0.0
-    for Xg, yg, Rg, wg in zip(X_groups, y_groups, corr_matrices, var_weights_groups):
-        Omega_inv = _build_omega_inv_block(Rg, wg)
-        resid = yg - Xg @ beta_hat
-        rss_weighted += resid @ Omega_inv @ resid
+    rss_weighted = _compute_rss(
+        X_groups, y_groups, omega_inv_list, beta_hat, n_jobs
+    )
 
     if method == "REML":
         denom = N - k
@@ -292,11 +379,13 @@ def compute_gls_estimates(
     # Compute log-likelihood at these estimates
     if method == "REML":
         loglik = profile_loglik_reml(
-            X_groups, y_groups, corr_matrices, var_weights_groups, nobs
+            X_groups, y_groups, corr_inverses, corr_logdets,
+            var_weights_groups, nobs, n_jobs
         )
     else:
         loglik = profile_loglik_ml(
-            X_groups, y_groups, corr_matrices, var_weights_groups, nobs
+            X_groups, y_groups, corr_inverses, corr_logdets,
+            var_weights_groups, nobs, n_jobs
         )
 
     return beta_hat, cov_beta, sigma2_hat, loglik

@@ -44,6 +44,44 @@ class CorCompSymm(CorStruct):
         np.fill_diagonal(R, 1.0)
         return R
 
+    def get_correlation_matrix_inverse(self, group_size: int, **kwargs) -> NDArray:
+        if self._params is None:
+            return np.eye(group_size)
+        rho = self._params[0]
+        if abs(rho) < 1e-15:
+            return np.eye(group_size)
+        m = group_size
+        if m == 1:
+            return np.array([[1.0]])
+        denom = 1.0 + (m - 1) * rho
+        # Fall back to dense if near-singular
+        if abs(denom) < 1e-12:
+            R = self.get_correlation_matrix(group_size, **kwargs)
+            return np.linalg.solve(R, np.eye(m))
+        # Sherman-Morrison: R^{-1} = (1/(1-rho)) * (I - (rho/((1-rho)*(1+(m-1)*rho))) * J)
+        scale_J = rho / ((1.0 - rho) * denom)
+        scale_diag = 1.0 / (1.0 - rho)
+        R_inv = np.full((m, m), -scale_J)
+        np.fill_diagonal(R_inv, scale_diag - scale_J)
+        return R_inv
+
+    def get_log_determinant(self, group_size: int, **kwargs) -> float:
+        if self._params is None:
+            return 0.0
+        rho = self._params[0]
+        if abs(rho) < 1e-15:
+            return 0.0
+        m = group_size
+        if m <= 1:
+            return 0.0
+        denom = 1.0 + (m - 1) * rho
+        if denom <= 0:
+            raise ValueError(
+                f"Correlation matrix has non-positive determinant: "
+                f"1 + (m-1)*rho = {denom}"
+            )
+        return (m - 1) * np.log(1.0 - rho) + np.log(denom)
+
     def _get_init_params(self, residuals_by_group: list[NDArray]) -> NDArray:
         # Estimate rho from average pairwise correlation of residuals
         corrs = []

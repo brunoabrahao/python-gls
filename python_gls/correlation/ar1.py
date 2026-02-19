@@ -42,6 +42,41 @@ class CorAR1(CorStruct):
         R = phi ** np.abs(indices[:, None] - indices[None, :])
         return R
 
+    def get_correlation_matrix_inverse(self, group_size: int, **kwargs) -> NDArray:
+        if self._params is None:
+            return np.eye(group_size)
+        phi = self._params[0]
+        if abs(phi) < 1e-15:
+            return np.eye(group_size)
+        m = group_size
+        if m == 1:
+            return np.array([[1.0]])
+        phi2 = phi * phi
+        denom = 1.0 - phi2
+        R_inv = np.zeros((m, m))
+        # Diagonal entries
+        R_inv[0, 0] = 1.0 / denom
+        R_inv[m - 1, m - 1] = 1.0 / denom
+        for i in range(1, m - 1):
+            R_inv[i, i] = (1.0 + phi2) / denom
+        # Off-diagonal entries
+        off = -phi / denom
+        for i in range(m - 1):
+            R_inv[i, i + 1] = off
+            R_inv[i + 1, i] = off
+        return R_inv
+
+    def get_log_determinant(self, group_size: int, **kwargs) -> float:
+        if self._params is None:
+            return 0.0
+        phi = self._params[0]
+        if abs(phi) < 1e-15:
+            return 0.0
+        m = group_size
+        if m <= 1:
+            return 0.0
+        return (m - 1) * np.log(1.0 - phi * phi)
+
     def _get_init_params(self, residuals_by_group: list[NDArray]) -> NDArray:
         # Estimate phi from lag-1 autocorrelation
         lag1_corrs = []
