@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "python-gls"
-version = "0.1.0"
+version = "0.2.0"
 description = "GLS estimator with learned correlation and variance structures (Python equivalent of R's nlme::gls)"
 readme = "README.md"
 license = "MIT"

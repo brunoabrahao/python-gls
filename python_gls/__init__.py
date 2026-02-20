@@ -24,6 +24,6 @@ Basic usage::
 from python_gls.model import GLS
 from python_gls.results import GLSResults
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = ["GLS", "GLSResults"]
